@@ -28,12 +28,13 @@
 			box-shadow: 0 4px 6px rgba(0, 0, 0, 0.5);
 			z-index: 10; /* Ensure it's above the canvas */
 		}
-		#inputPanel div {
+		#inputPanel > div { /* Direct div children of inputPanel for general spacing */
 			margin-bottom: 10px;
 		}
-		#inputPanel input {
+		#inputPanel input[type="text"],
+		#inputPanel input[type="color"],
+		#inputPanel input[type="number"] { /* Added number for future gradient stops */
 			width: 100%;
-			margin-bottom: 10px;
 			padding: 5px;
 			font-size: 14px;
 			background-color: #1e1e1e;
@@ -41,12 +42,26 @@
 			border: 1px solid #333;
 			border-radius: 3px;
 		}
+		/* Styling for divs that act as containers for a label and its control, or checkbox groups */
+		#inputPanel div.control-group {
+			margin-bottom: 10px;
+			display: flex;
+			flex-direction: column; /* Stack label above input by default */
+		}
+		#inputPanel div.checkbox-group {
+			display: flex;
+			align-items: center; /* Align checkbox and label horizontally */
+			margin-bottom: 10px;
+		}
 		#inputPanel label {
-			display: block;
 			margin-bottom: 5px;
 		}
-		#inputPanel input[type="checkbox"] {
-			margin-right: 5px;
+		#inputPanel div.checkbox-group label {
+			margin-bottom: 0; /* No bottom margin for labels next to checkboxes */
+			margin-left: 8px; /* Space between checkbox and label */
+		}
+		#inputPanel input[type="checkbox"]  {
+			width: auto; /* Let checkbox size itself */
 			vertical-align: middle;
 		}
 		#inputPanel button {
@@ -62,35 +77,49 @@
 		#inputPanel button:hover {
 			background-color: #0056b3;
 		}
+		#gizmoCanvas {
+			position: absolute;
+			bottom: 20px;
+			right: 20px;
+			width: 100px; /* Display size */
+			height: 100px; /* Display size */
+			/* background-color: rgba(50, 50, 50, 0.1); */ /* Optional: for debugging */
+			z-index: 20; 
+			cursor: grab;
+		}
 	</style>
 </head>
 <body>
 	<div id="inputPanel">
 		<h3>3D Equation Input</h3>
-		<input type="text" id="equationInput" placeholder="e.g., sin(sqrt(x^2+y^2))/sqrt(x^2+y^2)">
-		<div>
+		<div class="control-group">
+			<label for="equationInput">Equation (z = ...):</label>
+			<input type="text" id="equationInput" placeholder="e.g., sin(sqrt(x^2+y^2))/sqrt(x^2+y^2)">
+		</div>
+		<div class="control-group">
 			<label for="baseColorPicker">Base Gradient Color:</label>
 			<input type="color" id="baseColorPicker" value="#007bff">
 		</div>
-		<div>
+		<div class="checkbox-group">
 			<input type="checkbox" id="boundingBoxToggle" onchange="toggleBoundingBox()">
 			<label for="boundingBoxToggle">Show Bounding Box</label>
 		</div>
-		<div>
+		<div class="checkbox-group">
 			<input type="checkbox" id="lightingToggle" onchange="toggleLighting()" checked>
 			<label for="lightingToggle">Enable Dynamic Lighting</label>
 		</div>
-		<div>
+		<div class="checkbox-group">
 			<input type="checkbox" id="perspectiveCameraToggle" onchange="toggleCameraProjection()">
 			<label for="perspectiveCameraToggle">Use Perspective Camera</label>
 		</div>
-		<div>
+		<div class="checkbox-group">
 			<input type="checkbox" id="surfaceToggle" onchange="toggleSurface()">
 			<label for="surfaceToggle">Connect Dots (Surface)</label>
 		</div>
 		<button onclick="plotEquation()">Plot</button>
 	</div>
 	<canvas id="glCanvas" width="800" height="600"></canvas>
+	<canvas id="gizmoCanvas" width="100" height="100"></canvas> <!-- Gizmo Canvas -->
 	<script>
 		// --- Matrix and Vector Utilities ---
 		function subtractVectors(a, b) {
@@ -153,9 +182,29 @@
 		}
 		// --- End of Matrix and Vector Utilities ---
 
+		// --- Additional Matrix/Vector Utilities for Gizmo ---
+		function multiplyMatrix4ByVector4(out, matrix, vector) {
+			const m = matrix;
+			const v = vector;
+			const x = v[0], y = v[1], z = v[2], w = v[3] || 1.0; // Default w to 1 if not provided
+			out[0] = m[0] * x + m[4] * y + m[8] * z + m[12] * w;
+			out[1] = m[1] * x + m[5] * y + m[9] * z + m[13] * w;
+			out[2] = m[2] * x + m[6] * y + m[10] * z + m[14] * w;
+			out[3] = m[3] * x + m[7] * y + m[11] * z + m[15] * w;
+			return out;
+		}
+
+
+
 		(function() { // IIFE to encapsulate scope
 			const canvas = document.getElementById('glCanvas');
 			const gl = canvas.getContext('webgl');
+
+			const gizmoCanvas = document.getElementById('gizmoCanvas');
+			const gizmoGL = gizmoCanvas.getContext('webgl', { antialias: true });
+			let gizmoShaderProgram, gizmoVertexBuffer, gizmoColorBuffer;
+			let gizmoCoordLocation, gizmoColorLocation;
+			let gizmoProjectionMatrixLocation, gizmoViewMatrixLocation;
 
 			if (!gl) {
 				alert('WebGL not supported in this browser.');
@@ -165,7 +214,7 @@
 			// --- Global WebGL and App State ---
 			let shaderProgram;
 			let projectionMatrixLocation, viewMatrixLocation, uLightDirectionLocation, uEnableDynamicLightingLocation;
-			let colorAttributeLocation, normalAttributeLocation, coord;
+			let mainColorAttributeLocation, normalAttributeLocation, mainCoordLocation;
 			let boundingBoxShaderProgram, boundingBoxVertexBuffer, boundingBoxCoordLocation, bbProjectionMatrixLocation, bbViewMatrixLocation;
 			let vertexBuffer, indexBuffer;
 			let currentVertices = new Float32Array(0); // Store current vertices
@@ -186,6 +235,10 @@
 			let orbitRadius = 15;   // Distance for perspective camera, also used for lookAt.
 
 			let isDragging = false;
+			let isGizmoDragging = false;
+			let pickedGizmoAxis = null; // 'x', 'y', 'z', or null
+			let currentGizmoViewMatrix = createLookAtMatrix([0,0,2.5], [0,0,0], [0,1,0]); // Initial placeholder
+			let currentGizmoProjectionMatrix = createOrthographicMatrix(-1.2, 1.2, -1.2, 1.2, -10, 10); // Initial placeholder
 			let lastMouseX = 0, lastMouseY = 0;
 
 			const basePlotRange = 5; // Default range for x,y grid for plotting functions
@@ -245,6 +298,10 @@
 			const bbVertexShaderSource = `attribute vec3 coordinates; uniform mat4 projectionMatrix; uniform mat4 viewMatrix; void main() { gl_Position = projectionMatrix * viewMatrix * vec4(coordinates, 1.0); }`;
 			const bbFragmentShaderSource = `precision mediump float; void main() { gl_FragColor = vec4(1.0, 1.0, 1.0, 0.7); }`; // Semi-transparent white
 
+			// --- Gizmo Shader Sources ---
+			const gizmoVertexShaderSource = `attribute vec3 coordinates; attribute vec3 color; uniform mat4 projectionMatrix; uniform mat4 viewMatrix; varying vec3 vColor; void main() { gl_Position = projectionMatrix * viewMatrix * vec4(coordinates, 1.0); vColor = color; gl_PointSize = 5.0; }`;
+			const gizmoFragmentShaderSource = `precision mediump float; varying vec3 vColor; void main() { gl_FragColor = vec4(vColor, 1.0); }`;
+
 			// --- Initialization ---
 			function initWebGL() {
 				gl.clearColor(0.1, 0.1, 0.1, 1.0); // Dark grey background
@@ -265,9 +322,9 @@
 				
 				projectionMatrixLocation = gl.getUniformLocation(shaderProgram, 'projectionMatrix');
 				viewMatrixLocation = gl.getUniformLocation(shaderProgram, 'viewMatrix');
-				coord = gl.getAttribLocation(shaderProgram, 'coordinates');
+				mainCoordLocation = gl.getAttribLocation(shaderProgram, 'coordinates');
 				normalAttributeLocation = gl.getAttribLocation(shaderProgram, 'aVertexNormal');
-				colorAttributeLocation = gl.getAttribLocation(shaderProgram, 'aVertexColor');
+				mainColorAttributeLocation = gl.getAttribLocation(shaderProgram, 'aVertexColor');
 				uLightDirectionLocation = gl.getUniformLocation(shaderProgram, 'uLightDirection');
 				uEnableDynamicLightingLocation = gl.getUniformLocation(shaderProgram, 'uEnableDynamicLighting');
 
@@ -291,6 +348,8 @@
 				}
 				boundingBoxVertexBuffer = gl.createBuffer();
 				setupBoundingBoxGeometry();
+
+				initGizmoWebGL();
 
 				canvas.addEventListener('mousedown', onMouseDown);
 				canvas.addEventListener('mousemove', onMouseMove);
@@ -316,6 +375,50 @@
 				renderGraph(); // Initial clear
 			}
 
+			function initGizmoWebGL() {
+				if (!gizmoGL) {
+					console.error("Gizmo WebGL context not available.");
+					return;
+				}
+				gizmoGL.clearColor(0.0, 0.0, 0.0, 0.0); // Transparent background for gizmo
+
+				const vertexShader = compileShader(gizmoGL.VERTEX_SHADER, gizmoVertexShaderSource, gizmoGL);
+				const fragmentShader = compileShader(gizmoGL.FRAGMENT_SHADER, gizmoFragmentShaderSource, gizmoGL);
+				if (!vertexShader || !fragmentShader) return;
+
+				gizmoShaderProgram = gizmoGL.createProgram();
+				gizmoGL.attachShader(gizmoShaderProgram, vertexShader);
+				gizmoGL.attachShader(gizmoShaderProgram, fragmentShader);
+				gizmoGL.linkProgram(gizmoShaderProgram);
+				if (!gizmoGL.getProgramParameter(gizmoShaderProgram, gizmoGL.LINK_STATUS)) {
+					console.error('Gizmo Shader program linking error:', gizmoGL.getProgramInfoLog(gizmoShaderProgram));
+					return;
+				}
+
+				gizmoCoordLocation = gizmoGL.getAttribLocation(gizmoShaderProgram, 'coordinates');
+				gizmoColorLocation = gizmoGL.getAttribLocation(gizmoShaderProgram, 'color');
+				gizmoProjectionMatrixLocation = gizmoGL.getUniformLocation(gizmoShaderProgram, 'projectionMatrix');
+				gizmoViewMatrixLocation = gizmoGL.getUniformLocation(gizmoShaderProgram, 'viewMatrix');
+
+				gizmoVertexBuffer = gizmoGL.createBuffer();
+				gizmoColorBuffer = gizmoGL.createBuffer();
+				setupGizmoGeometry();
+
+				// Gizmo canvas event listeners (placeholder for now)
+				gizmoCanvas.addEventListener('mousedown', onGizmoMouseDown);
+				// Mouse move and up will be on the document to handle dragging outside the gizmo
+				// No, mousemove and mouseup should be on document to capture drags outside gizmo canvas
+				// document.addEventListener('mousemove', onGizmoMouseMove); // Added later conditionally
+				// document.addEventListener('mouseup', onGizmoMouseUp); // Added later conditionally
+			}
+
+			function setupGizmoGeometry() {
+				const L = 0.8; // Length of gizmo axes
+				const vertices = [0,0,0, L,0,0,  0,0,0, 0,L,0,  0,0,0, 0,0,L]; // X, Y, Z axes lines
+				const colors   = [1,0,0, 1,0,0,  0,1,0, 0,1,0,  0,0,1, 0,0,1]; // Red, Green, Blue
+				gizmoGL.bindBuffer(gizmoGL.ARRAY_BUFFER, gizmoVertexBuffer); gizmoGL.bufferData(gizmoGL.ARRAY_BUFFER, new Float32Array(vertices), gizmoGL.STATIC_DRAW);
+				gizmoGL.bindBuffer(gizmoGL.ARRAY_BUFFER, gizmoColorBuffer);  gizmoGL.bufferData(gizmoGL.ARRAY_BUFFER, new Float32Array(colors), gizmoGL.STATIC_DRAW);
+			}
 			function setupBoundingBoxGeometry() {
 				const r = basePlotRange; // Use the same range as the plot
 				const bbVertices = [
@@ -332,13 +435,13 @@
 
 			}
 
-			function compileShader(type, source) {
-				const shader = gl.createShader(type);
-				gl.shaderSource(shader, source);
-				gl.compileShader(shader);
-				if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-					console.error(`Shader compilation error (${type === gl.VERTEX_SHADER ? 'Vertex' : 'Fragment'}):`, gl.getShaderInfoLog(shader));
-					gl.deleteShader(shader);
+			function compileShader(type, source, context = gl) { // Added context parameter
+				const shader = context.createShader(type);
+				context.shaderSource(shader, source);
+				context.compileShader(shader);
+				if (!context.getShaderParameter(shader, context.COMPILE_STATUS)) {
+					console.error(`Shader compilation error (${type === context.VERTEX_SHADER ? 'Vertex' : 'Fragment'} Shader):`, context.getShaderInfoLog(shader));
+					context.deleteShader(shader);
 					return null;
 				}
 				return shader;
@@ -346,6 +449,10 @@
 
 			// --- Event Handlers ---
 			function onMouseDown(event) {
+				// Prevent main canvas drag if gizmo was clicked
+				if (event.target === gizmoCanvas) {
+					return;
+				}
 				isDragging = true;
 				lastMouseX = event.clientX;
 				lastMouseY = event.clientY;
@@ -366,6 +473,114 @@
 			function onMouseUp() { isDragging = false; }
 			function onMouseLeave() { isDragging = false; }
 
+			// Gizmo Interaction Logic
+			function worldToNdc(point3D, viewMatrix, projectionMatrix) {
+				const point4D_world = [point3D[0], point3D[1], point3D[2], 1.0];
+				let point4D_clip = [0,0,0,0];
+				let temp_view = [0,0,0,0];
+
+				multiplyMatrix4ByVector4(temp_view, viewMatrix, point4D_world);
+				multiplyMatrix4ByVector4(point4D_clip, projectionMatrix, temp_view);
+
+				if (point4D_clip[3] === 0) return null; // Avoid division by zero
+
+				return [
+					point4D_clip[0] / point4D_clip[3],
+					point4D_clip[1] / point4D_clip[3]
+				];
+			}
+
+			function distToSegmentSquared(p, v, w) {
+				const l2 = (v[0]-w[0])*(v[0]-w[0]) + (v[1]-w[1])*(v[1]-w[1]);
+				if (l2 === 0) return (p[0]-v[0])*(p[0]-v[0]) + (p[1]-v[1])*(p[1]-v[1]);
+				let t = ((p[0]-v[0])*(w[0]-v[0]) + (p[1]-v[1])*(w[1]-v[1])) / l2;
+				t = Math.max(0, Math.min(1, t));
+				const projX = v[0] + t * (w[0]-v[0]);
+				const projY = v[1] + t * (w[1]-v[1]);
+				return (p[0]-projX)*(p[0]-projX) + (p[1]-projY)*(p[1]-projY);
+			}
+
+			function onGizmoMouseDown(event) {
+				const rect = gizmoCanvas.getBoundingClientRect();
+				const mouseX_canvas = event.clientX - rect.left;
+				const mouseY_canvas = event.clientY - rect.top;
+
+				const ndcMouseX = (mouseX_canvas / gizmoCanvas.clientWidth) * 2 - 1;
+				const ndcMouseY = -(mouseY_canvas / gizmoCanvas.clientHeight) * 2 + 1;
+
+				const L = 0.8; // Gizmo axis length
+				const axes = {
+					x: { p0: [0,0,0], p1: [L,0,0] },
+					y: { p0: [0,0,0], p1: [0,L,0] },
+					z: { p0: [0,0,0], p1: [0,0,L] },
+				};
+
+				let minDistanceSq = Infinity;
+				pickedGizmoAxis = null;
+
+				for (const axisKey in axes) {
+					const axis = axes[axisKey];
+					const p0_ndc = worldToNdc(axis.p0, currentGizmoViewMatrix, currentGizmoProjectionMatrix);
+					const p1_ndc = worldToNdc(axis.p1, currentGizmoViewMatrix, currentGizmoProjectionMatrix);
+
+					if (p0_ndc && p1_ndc) {
+						const distanceSq = distToSegmentSquared([ndcMouseX, ndcMouseY], p0_ndc, p1_ndc);
+						if (distanceSq < minDistanceSq) {
+							minDistanceSq = distanceSq;
+							pickedGizmoAxis = axisKey;
+						}
+					}
+				}
+
+				const pickThresholdSq = 0.03; // Squared NDC units (0.15*0.15 approx)
+				if (minDistanceSq > pickThresholdSq) pickedGizmoAxis = null;
+
+				if (pickedGizmoAxis) {
+					isGizmoDragging = true;
+					lastMouseX = event.clientX; lastMouseY = event.clientY;
+					document.addEventListener('mousemove', onGizmoMouseMove, { capture: true });
+					document.addEventListener('mouseup', onGizmoMouseUp, { capture: true, once: true });
+					gizmoCanvas.style.cursor = 'grabbing';
+					event.stopPropagation(); // Prevent main canvas interaction
+				}
+			}
+
+			function onGizmoMouseMove(event) {
+				if (!isGizmoDragging || !pickedGizmoAxis) return;
+
+				const deltaX = event.clientX - lastMouseX;
+				const deltaY = event.clientY - lastMouseY;
+				const rotationSpeed = 0.01;
+
+				// Simplified rotation based on picked axis
+				// This is a common but not perfectly world-axis aligned rotation for typical orbit controls
+				if (pickedGizmoAxis === 'y') { // Simulate rotating around world Y
+					cameraAngleX -= deltaX * rotationSpeed;
+				} else if (pickedGizmoAxis === 'x') { // Simulate rotating around world X
+					cameraAngleY += deltaY * rotationSpeed; // Note: sign might depend on desired feel
+				} else if (pickedGizmoAxis === 'z') {
+					// Placeholder: A "roll" like behavior, or map to horizontal rotation
+					// True Z-axis rotation of the object from camera view is more complex with Euler angles
+					cameraAngleX -= deltaX * rotationSpeed * 0.5; // Less sensitive roll
+				}
+
+				cameraAngleY = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, cameraAngleY));
+
+				lastMouseX = event.clientX;
+				lastMouseY = event.clientY;
+				renderGraph();
+			}
+
+			function onGizmoMouseUp(event) {
+				if (isGizmoDragging) {
+					isGizmoDragging = false;
+					// pickedGizmoAxis = null; // Keep it if you want to know which axis was last used
+					document.removeEventListener('mousemove', onGizmoMouseMove, { capture: true });
+					// mouseup is {once: true} so it auto-removes
+					gizmoCanvas.style.cursor = 'grab';
+				}
+			}
+
 			function onWheel(event) {
 				event.preventDefault();
 				if (usePerspectiveCamera) {
@@ -385,6 +600,11 @@
 			function onResize() {
 				canvas.width = canvas.clientWidth;
 				canvas.height = canvas.clientHeight;
+				// Note: Gizmo canvas drawing buffer size is fixed by its HTML attributes.
+				// Its display size is set by CSS.
+				if(gizmoGL) {
+					gizmoGL.viewport(0, 0, gizmoGL.drawingBufferWidth, gizmoGL.drawingBufferHeight);
+				}
 				gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
 				updateProjectionMatrix();
 				renderGraph();
@@ -438,6 +658,7 @@
 				// This direction is fixed relative to the camera's view.
 				gl.uniform3f(uLightDirectionLocation, 0.577, 0.577, 0.577); // Normalized (1,1,1)
 
+				// --- Render Main Graph ---
 				if (numVertices > 0) {
 					// View Matrix (Orbiting Camera)
 					const eyeX = orbitRadius * Math.sin(cameraAngleX) * Math.cos(cameraAngleY);
@@ -453,26 +674,26 @@
 					const stride = 9 * Float32Array.BYTES_PER_ELEMENT; // x,y,z, nx,ny,nz, r,g,b
 					
 					// Coordinates
-					gl.vertexAttribPointer(coord, 3, gl.FLOAT, false, stride, 0);
-					gl.enableVertexAttribArray(coord);
+					gl.vertexAttribPointer(mainCoordLocation, 3, gl.FLOAT, false, stride, 0);
+					gl.enableVertexAttribArray(mainCoordLocation);
 					
 					// Normals
 					gl.vertexAttribPointer(normalAttributeLocation, 3, gl.FLOAT, false, stride, 3 * Float32Array.BYTES_PER_ELEMENT);
 					gl.enableVertexAttribArray(normalAttributeLocation);
 
 					// Colors
-					gl.vertexAttribPointer(colorAttributeLocation, 3, gl.FLOAT, false, stride, 6 * Float32Array.BYTES_PER_ELEMENT);
-					gl.enableVertexAttribArray(colorAttributeLocation);
+					gl.vertexAttribPointer(mainColorAttributeLocation, 3, gl.FLOAT, false, stride, 6 * Float32Array.BYTES_PER_ELEMENT);
+					gl.enableVertexAttribArray(mainColorAttributeLocation);
 
 					if (renderAsSurface && numIndices > 0 && currentIndexes) {
 						gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
 						gl.drawElements(gl.TRIANGLES, numIndices, gl.UNSIGNED_SHORT, 0); // Or gl.UNSIGNED_INT if numVertices > 65535
 					} else {
-						gl.drawArrays(gl.POINTS, 0, numVertices); // numVertices is count of distinct points
+						gl.drawArrays(gl.POINTS, 0, numVertices);
 					}
-					gl.disableVertexAttribArray(coord);
+					gl.disableVertexAttribArray(mainCoordLocation);
 					gl.disableVertexAttribArray(normalAttributeLocation);
-					gl.disableVertexAttribArray(colorAttributeLocation);
+					gl.disableVertexAttribArray(mainColorAttributeLocation);
 				}
 
 				// Draw Bounding Box if enabled
@@ -489,6 +710,45 @@
 					gl.drawArrays(gl.LINES, 0, 24); // 12 lines * 2 vertices per line
 					gl.disableVertexAttribArray(boundingBoxCoordLocation);
 				}
+
+				// --- Render Gizmo ---
+				renderGizmo();
+			}
+
+			function renderGizmo() {
+				if (!gizmoGL || !gizmoShaderProgram) return;
+
+				gizmoGL.clear(gizmoGL.COLOR_BUFFER_BIT | gizmoGL.DEPTH_BUFFER_BIT);
+				gizmoGL.useProgram(gizmoShaderProgram);
+				gizmoGL.enable(gizmoGL.DEPTH_TEST); // Enable depth testing for gizmo too
+
+				// Gizmo Projection (Orthographic, fixed size)
+				const orthoSize = 1.2; // How much of the gizmo axes are visible
+				const aspect = gizmoGL.drawingBufferWidth / gizmoGL.drawingBufferHeight;
+				const gizmoProj = createOrthographicMatrix(-orthoSize * aspect, orthoSize * aspect, -orthoSize, orthoSize, -10, 10);
+				gizmoGL.uniformMatrix4fv(gizmoProjectionMatrixLocation, false, gizmoProj);
+
+				// Gizmo View Matrix: Should be inverse of main camera's rotation, but fixed distance
+				// For now, let's use the same rotation as the main camera to see it move
+				// Later, we'll make it appear static from the user's gizmo viewpoint.
+				const gizmoOrbitRadius = 2.5; // Fixed distance for viewing the gizmo
+				const eyeX = gizmoOrbitRadius * Math.sin(cameraAngleX) * Math.cos(cameraAngleY);
+				const eyeY = gizmoOrbitRadius * Math.sin(cameraAngleY);
+				const eyeZ = gizmoOrbitRadius * Math.cos(cameraAngleX) * Math.cos(cameraAngleY);
+				const gizmoView = createLookAtMatrix([eyeX, eyeY, eyeZ], [0,0,0], [0,1,0]);
+				gizmoGL.uniformMatrix4fv(gizmoViewMatrixLocation, false, gizmoView);
+
+				// Bind and draw gizmo axes
+				gizmoGL.bindBuffer(gizmoGL.ARRAY_BUFFER, gizmoVertexBuffer);
+				gizmoGL.vertexAttribPointer(gizmoCoordLocation, 3, gizmoGL.FLOAT, false, 0, 0);
+				gizmoGL.enableVertexAttribArray(gizmoCoordLocation);
+
+				gizmoGL.bindBuffer(gizmoGL.ARRAY_BUFFER, gizmoColorBuffer);
+				gizmoGL.vertexAttribPointer(gizmoColorLocation, 3, gizmoGL.FLOAT, false, 0, 0);
+				gizmoGL.enableVertexAttribArray(gizmoColorLocation);
+
+				gizmoGL.lineWidth(2.0); // Make lines a bit thicker
+				gizmoGL.drawArrays(gizmoGL.LINES, 0, 6); // 3 axes * 2 vertices per line
 			}
 
 			// --- Surface Toggle ---
