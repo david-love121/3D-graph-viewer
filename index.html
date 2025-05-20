@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>3D Function Viewer</title>
+	<style>
+		body {
+			margin: 0;
+			background-color: #121212;
+			color: #ffffff;
+			font-family: Arial, sans-serif;
+		}
+		canvas {
+			display: block;
+			width: 100vw;
+			height: 100vh;
+			margin: 0;
+		}
+		#inputPanel {
+			position: absolute;
+			top: 10px;
+			left: 10px;			
+			width: 300px;
+			background-color: rgba(18, 18, 18, 0.9);
+			padding: 10px;
+			border-radius: 5px;
+			box-shadow: 0 4px 6px rgba(0, 0, 0, 0.5);
+			z-index: 10; /* Ensure it's above the canvas */
+		}
+		#inputPanel div {
+			margin-bottom: 10px;
+		}
+		#inputPanel input {
+			width: 100%;
+			margin-bottom: 10px;
+			padding: 5px;
+			font-size: 14px;
+			background-color: #1e1e1e;
+			color: #ffffff;
+			border: 1px solid #333;
+			border-radius: 3px;
+		}
+		#inputPanel label {
+			display: block;
+			margin-bottom: 5px;
+		}
+		#inputPanel input[type="checkbox"] {
+			margin-right: 5px;
+			vertical-align: middle;
+		}
+		#inputPanel button {
+			width: 100%;
+			padding: 5px;
+			font-size: 14px;
+			background-color: #007BFF;
+			color: white;
+			border: none;
+			border-radius: 3px;
+			cursor: pointer;
+		}
+		#inputPanel button:hover {
+			background-color: #0056b3;
+		}
+	</style>
+</head>
+<body>
+	<div id="inputPanel">
+		<h3>3D Equation Input</h3>
+		<input type="text" id="equationInput" placeholder="e.g., sin(sqrt(x^2+y^2))/sqrt(x^2+y^2)">
+		<div>
+			<label for="baseColorPicker">Base Gradient Color:</label>
+			<input type="color" id="baseColorPicker" value="#007bff">
+		</div>
+		<div>
+			<input type="checkbox" id="boundingBoxToggle" onchange="toggleBoundingBox()">
+			<label for="boundingBoxToggle">Show Bounding Box</label>
+		</div>
+		<div>
+			<input type="checkbox" id="lightingToggle" onchange="toggleLighting()" checked>
+			<label for="lightingToggle">Enable Dynamic Lighting</label>
+		</div>
+		<div>
+			<input type="checkbox" id="perspectiveCameraToggle" onchange="toggleCameraProjection()">
+			<label for="perspectiveCameraToggle">Use Perspective Camera</label>
+		</div>
+		<div>
+			<input type="checkbox" id="surfaceToggle" onchange="toggleSurface()">
+			<label for="surfaceToggle">Connect Dots (Surface)</label>
+		</div>
+		<button onclick="plotEquation()">Plot</button>
+	</div>
+	<canvas id="glCanvas" width="800" height="600"></canvas>
+	<script>
+		// --- Matrix and Vector Utilities ---
+		function subtractVectors(a, b) {
+			return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+		}
+		function normalize(v) {
+			const length = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+			if (length > 0.00001) {
+				return [v[0] / length, v[1] / length, v[2] / length];
+			}
+			return [0, 0, 0];
+		}
+		function crossProduct(a, b) {
+			return [
+				a[1] * b[2] - a[2] * b[1],
+				a[2] * b[0] - a[0] * b[2],
+				a[0] * b[1] - a[1] * b[0],
+			];
+		}
+		function dotProduct(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+		function createLookAtMatrix(eye, center, up) {
+			const f = normalize(subtractVectors(center, eye)); // Should be center - eye for forward if LH, eye - center for RH view matrix's Z basis
+			// Let's use standard view matrix: Z axis of camera = normalize(eye - center)
+			const zAxis = normalize(subtractVectors(eye, center));
+			const xAxis = normalize(crossProduct(normalize(up), zAxis));
+			const yAxis = normalize(crossProduct(zAxis, xAxis));
+
+			return new Float32Array([
+				xAxis[0], yAxis[0], zAxis[0], 0,
+				xAxis[1], yAxis[1], zAxis[1], 0,
+				xAxis[2], yAxis[2], zAxis[2], 0,
+				-dotProduct(xAxis, eye), -dotProduct(yAxis, eye), -dotProduct(zAxis, eye), 1,
+			]);
+		}
+
+		// Define an orthographic projection matrix
+		function createOrthographicMatrix(left, right, bottom, top, near, far) {
+			const rl = 1 / (right - left);
+			const tb = 1 / (top - bottom);
+			const fn = 1 / (far - near);
+			return new Float32Array([
+				2 * rl, 0, 0, 0,
+				0, 2 * tb, 0, 0,
+				0, 0, -2 * fn, 0, // Correctly maps Z to [-1, 1]
+				-(right + left) * rl, -(top + bottom) * tb, -(far + near) * fn, 1,
+			]);
+		}
+
+		// Define a perspective projection matrix
+		function createPerspectiveMatrix(fov, aspect, near, far) {
+			const f = 1.0 / Math.tan(fov / 2);
+			const rangeInv = 1.0 / (near - far);
+			return new Float32Array([
+				f / aspect, 0, 0, 0,
+				0, f, 0, 0,
+				0, 0, (far + near) * rangeInv, -1,
+				0, 0, (2 * far * near) * rangeInv, 0
+			]);
+		}
+		// --- End of Matrix and Vector Utilities ---
+
+		(function() { // IIFE to encapsulate scope
+			const canvas = document.getElementById('glCanvas');
+			const gl = canvas.getContext('webgl');
+
+			if (!gl) {
+				alert('WebGL not supported in this browser.');
+				return;
+			}
+
+			// --- Global WebGL and App State ---
+			let shaderProgram;
+			let projectionMatrixLocation, viewMatrixLocation, uLightDirectionLocation, uEnableDynamicLightingLocation;
+			let colorAttributeLocation, normalAttributeLocation, coord;
+			let boundingBoxShaderProgram, boundingBoxVertexBuffer, boundingBoxCoordLocation, bbProjectionMatrixLocation, bbViewMatrixLocation;
+			let vertexBuffer, indexBuffer;
+			let currentVertices = new Float32Array(0); // Store current vertices
+			let currentIndexes = null;
+			let numVertices = 0;
+			let numIndices = 0;
+
+			let renderAsSurface = false;
+			let showBoundingBox = false;
+			let enableDynamicLighting = true;
+			let usePerspectiveCamera = false;
+			
+			let baseGradientColor = '#007bff'; // Default base color
+			// Camera state
+			let cameraAngleX = 0.5; // Initial horizontal angle (radians)
+			let cameraAngleY = 0.5; // Initial vertical angle (radians)
+			let zoomLevel = 1.5;    // Orthographic zoom: smaller value = "zoomed in" / larger graph
+			let orbitRadius = 15;   // Distance for perspective camera, also used for lookAt.
+
+			let isDragging = false;
+			let lastMouseX = 0, lastMouseY = 0;
+
+			const basePlotRange = 5; // Default range for x,y grid for plotting functions
+
+			// --- Shader Sources ---
+			const vertexShaderSource = `
+				attribute vec3 coordinates;
+				attribute vec3 aVertexNormal;
+				attribute vec3 aVertexColor; 
+				uniform mat4 projectionMatrix;
+				uniform mat4 viewMatrix;
+
+				varying vec3 vNormal;
+				varying vec3 vColor; // Pass color to fragment shader
+				varying vec3 vFragPosViewSpace; // Vertex position in view space
+
+				void main(void) {
+					gl_Position = projectionMatrix * viewMatrix * vec4(coordinates, 1.0);
+					gl_PointSize = 2.0; // Make points a bit larger
+					
+					// Transform normal to view space (assumes viewMatrix has no non-uniform scaling)
+					vNormal = normalize(mat3(viewMatrix) * aVertexNormal);
+					vColor = aVertexColor;
+					vFragPosViewSpace = vec3(viewMatrix * vec4(coordinates, 1.0));
+				}
+			`;
+			const fragmentShaderSource = `
+				precision mediump float;
+				varying vec3 vColor; // Receive color from vertex shader
+				varying vec3 vNormal;
+				varying vec3 vFragPosViewSpace; // Interpolated fragment position in view space
+				uniform vec3 uLightDirection; // Light direction in View Space
+				uniform bool uEnableDynamicLighting;
+
+				void main(void) {
+					vec3 normal = normalize(vNormal);
+					vec3 litColor;
+
+					if (uEnableDynamicLighting) {
+						vec3 lightDir = normalize(uLightDirection);
+						float diffuseIntensity = max(dot(normal, lightDir), 0.0);
+						float ambientIntensity = 0.3;
+						litColor = vColor * (ambientIntensity + diffuseIntensity * 0.7);
+					} else {
+						// Flat lighting based on normal's Z in view space
+						float facingRatio = normal.z * 0.5 + 0.5; // Map [-1,1] to [0,1]
+						// Make it brighter if facing camera (normal.z > 0), dimmer if facing away
+						// A steeper curve for more distinct front/back:
+						float lightFactor = smoothstep(-0.2, 0.2, normal.z) * 0.6 + 0.4; // Range [0.4, 1.0]
+						litColor = vColor * lightFactor;
+					}
+
+					gl_FragColor = vec4(litColor, 1.0);
+				}
+			`;
+
+			const bbVertexShaderSource = `attribute vec3 coordinates; uniform mat4 projectionMatrix; uniform mat4 viewMatrix; void main() { gl_Position = projectionMatrix * viewMatrix * vec4(coordinates, 1.0); }`;
+			const bbFragmentShaderSource = `precision mediump float; void main() { gl_FragColor = vec4(1.0, 1.0, 1.0, 0.7); }`; // Semi-transparent white
+
+			// --- Initialization ---
+			function initWebGL() {
+				gl.clearColor(0.1, 0.1, 0.1, 1.0); // Dark grey background
+
+				const vertexShader = compileShader(gl.VERTEX_SHADER, vertexShaderSource);
+				const fragmentShader = compileShader(gl.FRAGMENT_SHADER, fragmentShaderSource);
+				if (!vertexShader || !fragmentShader) return;
+
+				shaderProgram = gl.createProgram();
+				gl.attachShader(shaderProgram, vertexShader);
+				gl.attachShader(shaderProgram, fragmentShader);
+				gl.linkProgram(shaderProgram);
+				if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+					console.error('Shader program linking error:', gl.getProgramInfoLog(shaderProgram));
+					gl.deleteProgram(shaderProgram);
+					return;
+				}
+				
+				projectionMatrixLocation = gl.getUniformLocation(shaderProgram, 'projectionMatrix');
+				viewMatrixLocation = gl.getUniformLocation(shaderProgram, 'viewMatrix');
+				coord = gl.getAttribLocation(shaderProgram, 'coordinates');
+				normalAttributeLocation = gl.getAttribLocation(shaderProgram, 'aVertexNormal');
+				colorAttributeLocation = gl.getAttribLocation(shaderProgram, 'aVertexColor');
+				uLightDirectionLocation = gl.getUniformLocation(shaderProgram, 'uLightDirection');
+				uEnableDynamicLightingLocation = gl.getUniformLocation(shaderProgram, 'uEnableDynamicLighting');
+
+				vertexBuffer = gl.createBuffer();
+				indexBuffer = gl.createBuffer();
+
+				// Bounding Box Shader Program
+				const bbVertexShader = compileShader(gl.VERTEX_SHADER, bbVertexShaderSource);
+				const bbFragmentShader = compileShader(gl.FRAGMENT_SHADER, bbFragmentShaderSource);
+				if (bbVertexShader && bbFragmentShader) {
+					boundingBoxShaderProgram = gl.createProgram();
+					gl.attachShader(boundingBoxShaderProgram, bbVertexShader);
+					gl.attachShader(boundingBoxShaderProgram, bbFragmentShader);
+					gl.linkProgram(boundingBoxShaderProgram);
+					if (!gl.getProgramParameter(boundingBoxShaderProgram, gl.LINK_STATUS)) {
+						console.error('Bounding Box Shader linking error:', gl.getProgramInfoLog(boundingBoxShaderProgram));
+					}
+					boundingBoxCoordLocation = gl.getAttribLocation(boundingBoxShaderProgram, 'coordinates');
+					bbProjectionMatrixLocation = gl.getUniformLocation(boundingBoxShaderProgram, 'projectionMatrix');
+					bbViewMatrixLocation = gl.getUniformLocation(boundingBoxShaderProgram, 'viewMatrix');
+				}
+				boundingBoxVertexBuffer = gl.createBuffer();
+				setupBoundingBoxGeometry();
+
+				canvas.addEventListener('mousedown', onMouseDown);
+				canvas.addEventListener('mousemove', onMouseMove);
+				document.addEventListener('mouseup', onMouseUp); // Listen on document for robust mouse up
+				canvas.addEventListener('mouseleave', onMouseLeave);
+				canvas.addEventListener('wheel', onWheel, { passive: false }); // passive:false for preventDefault
+				window.addEventListener('resize', onResize);
+				
+				const colorPicker = document.getElementById('baseColorPicker');
+				baseGradientColor = colorPicker.value;
+				colorPicker.addEventListener('input', (event) => {
+					baseGradientColor = event.target.value;
+					if (currentVertices.length > 0) plotEquation(); // Re-plot if data exists
+				});
+
+				// Initialize renderAsSurface from checkbox state
+				showBoundingBox = document.getElementById('boundingBoxToggle').checked;
+				enableDynamicLighting = document.getElementById('lightingToggle').checked;
+				usePerspectiveCamera = document.getElementById('perspectiveCameraToggle').checked;
+				renderAsSurface = document.getElementById('surfaceToggle').checked;
+
+				onResize(); // Initial setup for canvas size, viewport, and projection
+				renderGraph(); // Initial clear
+			}
+
+			function setupBoundingBoxGeometry() {
+				const r = basePlotRange; // Use the same range as the plot
+				const bbVertices = [
+					// Bottom face
+					-r,-r,-r,  r,-r,-r,   r,-r,-r,  r, r,-r,   r, r,-r, -r, r,-r,  -r, r,-r, -r,-r,-r,
+					// Top face
+					-r,-r, r,  r,-r, r,   r,-r, r,  r, r, r,   r, r, r, -r, r, r,  -r, r, r, -r,-r, r,
+					// Connecting lines
+					-r,-r,-r, -r,-r, r,   r,-r,-r,  r,-r, r,   r, r,-r,  r, r, r,  -r, r,-r, -r, r, r
+				];
+				gl.bindBuffer(gl.ARRAY_BUFFER, boundingBoxVertexBuffer);
+				gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(bbVertices), gl.STATIC_DRAW);
+				gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+			}
+
+			function compileShader(type, source) {
+				const shader = gl.createShader(type);
+				gl.shaderSource(shader, source);
+				gl.compileShader(shader);
+				if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+					console.error(`Shader compilation error (${type === gl.VERTEX_SHADER ? 'Vertex' : 'Fragment'}):`, gl.getShaderInfoLog(shader));
+					gl.deleteShader(shader);
+					return null;
+				}
+				return shader;
+			}
+
+			// --- Event Handlers ---
+			function onMouseDown(event) {
+				isDragging = true;
+				lastMouseX = event.clientX;
+				lastMouseY = event.clientY;
+			}
+
+			function onMouseMove(event) {
+				if (!isDragging) return;
+				const deltaX = event.clientX - lastMouseX;
+				const deltaY = event.clientY - lastMouseY;
+				cameraAngleX += deltaX * 0.005;
+				cameraAngleY -= deltaY * 0.005;
+				cameraAngleY = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, cameraAngleY)); // Clamp vertical angle
+				lastMouseX = event.clientX;
+				lastMouseY = event.clientY;
+				renderGraph();
+			}
+
+			function onMouseUp() { isDragging = false; }
+			function onMouseLeave() { isDragging = false; }
+
+			function onWheel(event) {
+				event.preventDefault();
+				if (usePerspectiveCamera) {
+					const zoomSensitivity = orbitRadius * 0.1; // Scale sensitivity with current distance
+					orbitRadius += event.deltaY * zoomSensitivity * 0.05;
+					orbitRadius = Math.max(basePlotRange * 0.5, Math.min(orbitRadius, basePlotRange * 20));
+				} else {
+					const zoomSensitivity = 0.1;
+					if (event.deltaY < 0) zoomLevel -= zoomSensitivity;
+					else zoomLevel += zoomSensitivity;
+					zoomLevel = Math.max(0.1, Math.min(zoomLevel, 10.0));
+				}
+				updateProjectionMatrix();
+				renderGraph();
+			}
+
+			function onResize() {
+				canvas.width = canvas.clientWidth;
+				canvas.height = canvas.clientHeight;
+				gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+				updateProjectionMatrix();
+				renderGraph();
+			}
+
+			// --- Update and Render Logic ---
+			function updateProjectionMatrix() {
+				if (!gl || !shaderProgram) return;
+				const aspect = gl.drawingBufferWidth / gl.drawingBufferHeight;
+				let projMatrix;
+
+				if (usePerspectiveCamera) {
+					const fov = Math.PI / 4; // Field of View
+					const near = 0.1;
+					const far = basePlotRange * 50; // Adjust far plane
+					projMatrix = createPerspectiveMatrix(fov, aspect, near, far);
+				} else {
+					const orthoVisibleHeight = basePlotRange * zoomLevel;
+					const orthoVisibleWidth = orthoVisibleHeight * aspect;
+					const left = -orthoVisibleWidth / 2;
+					const right = orthoVisibleWidth / 2;
+					const bottom = -orthoVisibleHeight / 2;
+					const top = orthoVisibleHeight / 2;
+					const depth = basePlotRange * 20;
+					const nearPlane = -depth; // Adjusted for typical orthographic setup where near is further away
+					const farPlane = depth;
+					projMatrix = createOrthographicMatrix(left, right, bottom, top, nearPlane, farPlane);
+				}
+
+				gl.useProgram(shaderProgram); // Ensure correct program is active
+				gl.uniformMatrix4fv(projectionMatrixLocation, false, projMatrix);
+
+				if (boundingBoxShaderProgram) { // Also update for bounding box shader
+					gl.useProgram(boundingBoxShaderProgram);
+					gl.uniformMatrix4fv(bbProjectionMatrixLocation, false, projMatrix);
+				}
+				gl.useProgram(shaderProgram); // Switch back to main
+			}
+
+			function renderGraph() {
+				if (!gl || !shaderProgram) return;
+
+				gl.enable(gl.DEPTH_TEST);
+				gl.depthFunc(gl.LEQUAL);
+				gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+				
+				gl.useProgram(shaderProgram);
+				gl.uniform1i(uEnableDynamicLightingLocation, enableDynamicLighting);
+				
+				// Set light direction (example: from top-right-front in view space)
+				// This direction is fixed relative to the camera's view.
+				gl.uniform3f(uLightDirectionLocation, 0.577, 0.577, 0.577); // Normalized (1,1,1)
+
+				if (numVertices > 0) {
+					// View Matrix (Orbiting Camera)
+					const eyeX = orbitRadius * Math.sin(cameraAngleX) * Math.cos(cameraAngleY);
+					const eyeY = orbitRadius * Math.sin(cameraAngleY);
+					const eyeZ = orbitRadius * Math.cos(cameraAngleX) * Math.cos(cameraAngleY);
+					const eye = [eyeX, eyeY, eyeZ];
+					const target = [0, 0, 0]; // Look at the origin
+					const up = [0, 1, 0];     // Y is up
+					const viewMat = createLookAtMatrix(eye, target, up);
+					gl.uniformMatrix4fv(viewMatrixLocation, false, viewMat);
+
+					gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+					const stride = 9 * Float32Array.BYTES_PER_ELEMENT; // x,y,z, nx,ny,nz, r,g,b
+					
+					// Coordinates
+					gl.vertexAttribPointer(coord, 3, gl.FLOAT, false, stride, 0);
+					gl.enableVertexAttribArray(coord);
+					
+					// Normals
+					gl.vertexAttribPointer(normalAttributeLocation, 3, gl.FLOAT, false, stride, 3 * Float32Array.BYTES_PER_ELEMENT);
+					gl.enableVertexAttribArray(normalAttributeLocation);
+
+					// Colors
+					gl.vertexAttribPointer(colorAttributeLocation, 3, gl.FLOAT, false, stride, 6 * Float32Array.BYTES_PER_ELEMENT);
+					gl.enableVertexAttribArray(colorAttributeLocation);
+
+					if (renderAsSurface && numIndices > 0 && currentIndexes) {
+						gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+						gl.drawElements(gl.TRIANGLES, numIndices, gl.UNSIGNED_SHORT, 0); // Or gl.UNSIGNED_INT if numVertices > 65535
+					} else {
+						gl.drawArrays(gl.POINTS, 0, numVertices); // numVertices is count of distinct points
+					}
+					gl.disableVertexAttribArray(coord);
+					gl.disableVertexAttribArray(normalAttributeLocation);
+					gl.disableVertexAttribArray(colorAttributeLocation);
+				}
+
+				// Draw Bounding Box if enabled
+				if (showBoundingBox && boundingBoxShaderProgram) {
+					const eye = [orbitRadius * Math.sin(cameraAngleX) * Math.cos(cameraAngleY), orbitRadius * Math.sin(cameraAngleY), orbitRadius * Math.cos(cameraAngleX) * Math.cos(cameraAngleY)];
+					const target = [0,0,0]; const up = [0,1,0];
+					const viewMat = createLookAtMatrix(eye, target, up);
+
+					gl.useProgram(boundingBoxShaderProgram);
+					gl.uniformMatrix4fv(bbViewMatrixLocation, false, viewMat); // Projection is set in updateProjectionMatrix
+					gl.bindBuffer(gl.ARRAY_BUFFER, boundingBoxVertexBuffer);
+					gl.vertexAttribPointer(boundingBoxCoordLocation, 3, gl.FLOAT, false, 0, 0);
+					gl.enableVertexAttribArray(boundingBoxCoordLocation);
+					gl.drawArrays(gl.LINES, 0, 24); // 12 lines * 2 vertices per line
+					gl.disableVertexAttribArray(boundingBoxCoordLocation);
+				}
+			}
+
+			// --- Surface Toggle ---
+			window.toggleSurface = function() {
+				renderAsSurface = document.getElementById('surfaceToggle').checked;
+				if (currentVertices.length > 0) { // Only re-process if data exists
+					plotEquation(); // Re-plot to generate indices or switch draw mode
+				} else {
+					renderGraph(); // Just re-render (e.g. to clear if it was a surface)
+				}
+			}
+
+			window.toggleBoundingBox = function() {
+				showBoundingBox = document.getElementById('boundingBoxToggle').checked;
+				renderGraph();
+			}
+			window.toggleLighting = function() {
+				enableDynamicLighting = document.getElementById('lightingToggle').checked;
+				renderGraph();
+			}
+			window.toggleCameraProjection = function() {
+				usePerspectiveCamera = document.getElementById('perspectiveCameraToggle').checked;
+				// Reset zoom/orbitRadius to sensible defaults when switching
+				if (usePerspectiveCamera) orbitRadius = basePlotRange * 3; else zoomLevel = 1.5;
+				updateProjectionMatrix();
+				renderGraph();
+			}
+
+			// --- Global plotEquation function, exposed to HTML ---
+			window.plotEquation = function() {
+				const equationStr = document.getElementById('equationInput').value;
+				if (!equationStr.trim()) {
+					currentVertices = new Float32Array(0); // xyz nxnynz rgb data
+					currentIndexes = null;
+					numVertices = 0;
+					numIndices = 0;
+					renderGraph(); // Clear the screen
+					return;
+				}
+				console.log('Plotting equation:', equationStr);
+
+			let func;
+			try {
+					// User types "sin(x)", "COS(Y)", "Pi"
+					// We want the Function to see "sin(x)", "cos(y)", "PI"
+					// to match the destructured Math properties.
+					let userProcessedEquation = equationStr
+						.replace(/\^/g, '**') // Exponents
+						// Add more specific replacements as needed, e.g. for constants or functions not in Math
+						;
+
+					// Case-insensitive replacement for function names and constants to match Math object properties
+					const mathMappings = {
+						'sin': 'sin', 'cos': 'cos', 'tan': 'tan',
+						'asin': 'asin', 'acos': 'acos', 'atan': 'atan', 'atan2': 'atan2',
+						'sqrt': 'sqrt', 'abs': 'abs', 'exp': 'exp', 
+						'log': 'log', // Math.log is natural log (ln)
+						'ln': 'log', 
+						'log10': 'log10', 'log2': 'log2',
+						'pow': 'pow', 'floor': 'floor', 'ceil': 'ceil', 'round': 'round',
+						'min': 'min', 'max': 'max', 'random': 'random',
+						'pi': 'PI', 'e': 'E'
+						// Add other direct Math properties if needed
+					};
+
+					for (const key in mathMappings) {
+						userProcessedEquation = userProcessedEquation.replace(new RegExp('\\b' + key + '\\b', 'gi'), mathMappings[key]);
+					}
+
+					// Basic validation for allowed characters after replacements.
+					// Allows: a-z, A-Z (for function names like PI, E, sin), x, y, numbers, spaces, . + - * / ( ) %
+					// This is a basic check, not a full parser.
+					if (/[^a-zA-Zxy\d\s\.\+\-\*\/\(\)\%]/.test(userProcessedEquation)) {
+						 throw new Error("Equation contains invalid characters after processing: " + userProcessedEquation.match(/[^a-zA-Zxy\d\s\.\+\-\*\/\(\)\%]/g));
+					}
+
+					func = new Function('x', 'y', `
+						const { PI, E, sqrt, sin, cos, tan, asin, acos, atan, atan2, exp, log, log10, log2, pow, abs, random, floor, ceil, round, min, max } = Math;
+						return ${userProcessedEquation};
+					`);
+			} catch (error) {
+					console.error("Equation parsing error:", error);
+					alert('Invalid equation. Use x, y, numbers, operators (+-*/%**), and common functions (sin, cos, sqrt, PI, etc.). Error: ' + error.message);
+				return;
+			}
+
+				const pointsData = []; // Will store [x,y,z, nx,ny,nz, r,g,b, ...]
+				const indicesData = [];
+				const step = 0.25; // Step size for the grid
+				const range = basePlotRange;
+
+				// Store Z values and raw (x,y,z) points in a grid for easier normal calculation
+				const numStepsX = Math.floor(2 * range / step) + 1;
+				const numStepsY = Math.floor(2 * range / step) + 1;
+				const gridPoints = Array(numStepsY).fill(null).map(() => Array(numStepsX).fill(null));
+				let minZ = Infinity, maxZ = -Infinity;
+
+				for (let j = 0; j < numStepsY; j++) {
+					const y = -range + j * step;
+					for (let i = 0; i < numStepsX; i++) {
+						const x = -range + i * step;
+						try {
+							const z = func(x, y);
+							if (Number.isFinite(z)) {
+								gridPoints[j][i] = {x, y, z};
+								minZ = Math.min(minZ, z);
+								maxZ = Math.max(maxZ, z);
+							}
+						} catch (e) { /* Point is invalid */ }
+					}
+				}
+				if (minZ === Infinity) { // No valid points
+					minZ = 0; maxZ = 1;
+				} else if (minZ === maxZ) {
+					maxZ = minZ + 1; // Avoid division by zero for color normalization
+				}
+
+				const pointMap = new Map(); // Maps (i,j) grid coord to vertex index in pointsData
+				let vertexCount = 0;
+				const baseHsl = rgbToHsl(...hexToRgb(baseGradientColor));
+
+				for (let j = 0; j < numStepsY; j++) {
+					for (let i = 0; i < numStepsX; i++) {
+						const pt = gridPoints[j][i];
+						if (pt) {
+							const {x, y, z} = pt;
+							// Calculate Normal using finite differences
+							const pL = gridPoints[j][i-1]?.z ?? z; // Point Left
+							const pR = gridPoints[j][i+1]?.z ?? z; // Point Right
+							const pD = gridPoints[j-1]?.[i]?.z ?? z; // Point Down
+							const pU = gridPoints[j+1]?.[i]?.z ?? z; // Point Up
+
+							const dz_dx = (pR - pL) / (2 * step); // Approximate df/dx
+							const dz_dy = (pU - pD) / (2 * step); // Approximate df/dy
+							
+							// Normal vector is (-dz/dx, -dz/dy, 1) or its opposite
+							// We want normal pointing "upwards" relative to surface for lighting
+							const normal = normalize([-dz_dx, -dz_dy, 1.0]);
+
+							const color = getColorForZ(z, minZ, maxZ, baseHsl);
+							pointsData.push(x, y, z, normal[0], normal[1], normal[2], color[0], color[1], color[2]);
+								pointMap.set(`${i},${j}`, vertexCount++);
+						} else {
+							pointMap.set(`${i},${j}`, -1);
+						}
+					}
+				}
+
+				currentVertices = new Float32Array(pointsData);
+				numVertices = vertexCount; 
+
+				if (renderAsSurface) {
+					for (let j = 0; j < numStepsY - 1; j++) {
+						for (let i = 0; i < numStepsX - 1; i++) {
+							const p00 = pointMap.get(`${i},${j}`);     // current
+							const p10 = pointMap.get(`${i+1},${j}`);   // right
+							const p01 = pointMap.get(`${i},${j+1}`);   // top
+							const p11 = pointMap.get(`${i+1},${j+1}`); // top-right
+
+							if (p00 !== -1 && p10 !== -1 && p01 !== -1) {
+								indicesData.push(p00, p10, p01);
+							}
+							if (p10 !== -1 && p11 !== -1 && p01 !== -1) {
+								indicesData.push(p10, p11, p01);
+							}
+						}
+					}
+					currentIndexes = new Uint16Array(indicesData); // Use Uint32Array if numVertices > 65535
+					numIndices = currentIndexes.length;
+				} else {
+					currentIndexes = null;
+					numIndices = 0;
+				}
+
+				if (numVertices === 0 && equationStr.trim()) {
+					 alert("Could not generate any valid points for the equation. Check for issues like division by zero over the entire domain or invalid Math operations.");
+				}
+
+				gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+				gl.bufferData(gl.ARRAY_BUFFER, currentVertices, gl.STATIC_DRAW);
+
+				if (renderAsSurface && numIndices > 0) {
+					gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+					gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, currentIndexes, gl.STATIC_DRAW);
+				}
+
+				// Reset camera to a default view when plotting a new equation
+				// cameraAngleX = 0.5; // Keep current camera for re-plots due to toggle
+				// cameraAngleY = 0.5;
+				// zoomLevel = 1.5; 
+				updateProjectionMatrix(); // Update projection matrix (aspect might have changed or for initial setup)
+				renderGraph();
+			}
+
+			// --- Helper Functions ---
+			function hexToRgb(hex) {
+				let r = 0, g = 0, b = 0;
+				if (hex.length == 4) { // #RGB
+					r = parseInt(hex[1] + hex[1], 16);
+					g = parseInt(hex[2] + hex[2], 16);
+					b = parseInt(hex[3] + hex[3], 16);
+				} else if (hex.length == 7) { // #RRGGBB
+					r = parseInt(hex[1] + hex[2], 16);
+					g = parseInt(hex[3] + hex[4], 16);
+					b = parseInt(hex[5] + hex[6], 16);
+				}
+				return [r / 255, g / 255, b / 255];
+			}
+
+			function rgbToHsl(r, g, b) {
+				const max = Math.max(r, g, b), min = Math.min(r, g, b);
+				let h, s, l = (max + min) / 2;
+				if (max === min) {
+					h = s = 0; // achromatic
+				} else {
+					const d = max - min;
+					s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+					switch (max) {
+						case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+						case g: h = (b - r) / d + 2; break;
+						case b: h = (r - g) / d + 4; break;
+					}
+					h /= 6;
+				}
+				return [h, s, l];
+			}
+
+			function getColorForZ(z, minZ, maxZ, baseHsl) {
+				if (!isFinite(z) || !baseHsl) return [0.5, 0.5, 0.5]; // Default grey
+				if (minZ === maxZ) return hslToRgb(baseHsl[0], baseHsl[1], baseHsl[2] * 0.75); // Flat surface, use base color slightly modified
+
+				const normalizedZ = Math.max(0, Math.min(1, (z - minZ) / (maxZ - minZ))); // Clamp to [0,1]
+				const [h_base, s_base, l_base] = baseHsl;
+				// Vary lightness from 0.3 * l_base (at minZ) to l_base (at maxZ)
+				// Vary saturation from 0.5 * s_base to s_base
+				const finalL = l_base * (0.4 + 0.6 * normalizedZ);
+				const finalS = s_base * (0.6 + 0.4 * normalizedZ);
+				return hslToRgb(h_base, Math.max(0, Math.min(1, finalS)), Math.max(0, Math.min(1, finalL)));
+			}
+			function hslToRgb(h, s, l) {
+				let r, g, b;
+				if (s === 0) {
+					r = g = b = l; // achromatic
+				} else {
+					const hue2rgb = (p, q, t) => {
+						if (t < 0) t += 1;
+						if (t > 1) t -= 1;
+						if (t < 1 / 6) return p + (q - p) * 6 * t;
+						if (t < 1 / 2) return q;
+						if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+						return p;
+					};
+					const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+					const p = 2 * l - q;
+					r = hue2rgb(p, q, h + 1 / 3);
+					g = hue2rgb(p, q, h);
+					b = hue2rgb(p, q, h - 1 / 3);
+				}
+				return [r, g, b];
+			}
+
+			// --- Start ---
+			initWebGL();
+			document.getElementById('equationInput').value = "sin(sqrt(x^2+y^2)+0.1)/(sqrt(x^2+y^2)+0.1)"; // Avoid 0/0 at origin
+			plotEquation();
+
+		})(); // End of IIFE
+	</script>
+</body>
+</html>
