@@ -1,6 +1,6 @@
 # Interactive 3D Function Viewer
 
-This project is a web-based interactive 3D function viewer that allows users to input mathematical equations of the form `z = f(x,y)` and visualize them as 3D surfaces or point clouds. We've built this together to explore WebGL and create a handy tool for visualizing mathematical concepts.
+This project is a web-based interactive 3D function viewer that allows users to input mathematical equations of the form `z = f(x,y)` and visualize them as 3D surfaces or point clouds. I built this together with Gemini to explore WebGL and create a handy tool for visualizing mathematical concepts. Generative AI was used to create this project and Gemini wrote the majority of the readme. 
 
 ## Features
 
